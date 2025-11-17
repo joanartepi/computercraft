@@ -1,438 +1,423 @@
---[[ 
-Slot 1-13 : Blocs "poubelle" (templates pour comparaison éventuelle)
-Slot 14   : Peut rester vide (utilisé au besoin, pas critique ici)
-Slot 15   : Seau (bucket) – pas utilisé par défaut dans cette version
-Slot 16   : Carburant
-Coffre    : sous la turtle au point de départ
-Usage     : excavate <X> <Z> <Y> <durée...>
+--[[
+Excavation complète d'un volume X × Z × Y
+- X : longueur (avant la turtle)
+- Z : largeur (sur le côté droit)
+- Y : profondeur (vers le bas)
+
+Disposition :
+- La turtle démarre à (0,0,0), tournée vers +X (avant).
+- Un coffre est placé DIRECTEMENT DERRIÈRE la turtle (direction -X).
+- Le volume miné commence sous la turtle (on descend d'un bloc avant de creuser).
+
+Slots :
+- 1..14 : loot
+- 15    : seau (bucket) pour la lave
+- 16    : fuel solide (charbon, etc.)
+
+Usage :
+  excavator <X> <Z> <Y> <durée...>
+Exemples :
+  excavator 16 16 8 1 hour
+  excavator 10 5 3 30 minutes
 ]]--
 
-local ok          = true
-local tArgs       = { ... }
-local ignoredFuel = 0
-local oldprint    = print
-local fuelAmount  = nil
-local nSlots      = nil
+local oldprint = print
+local function print(text)
+  oldprint("[" .. os.time() .. "] " .. text)
+  local file = fs.open("turtleLog", "a")
+  file.writeLine("[" .. os.time() .. "] " .. text)
+  file.close()
+end
 
--- Dimensions de l'excavation
-local sizeX = tonumber(tArgs[1]) -- longueur avant
-local sizeZ = tonumber(tArgs[2]) -- largeur
-local sizeY = tonumber(tArgs[3]) -- profondeur (vers le bas)
+local args = { ... }
+local ok        = true
+local timeUp    = false
+local needReturn = false
+
+-- Dimensions
+local sizeX = tonumber(args[1])
+local sizeZ = tonumber(args[2])
+local sizeY = tonumber(args[3])
 
 if not sizeX or not sizeZ or not sizeY then
-    error("Usage: excavate <X> <Z> <Y> <duration...>")
+  error("Usage: excavator <X> <Z> <Y> <duration...>")
 end
 
--- Arguments restants pour le timer (facultatif)
+-- Args restants pour le timer
 local timeArgs = {}
-for i = 4, #tArgs do
-    table.insert(timeArgs, tArgs[i])
+for i = 4, #args do
+  table.insert(timeArgs, args[i])
 end
 
 ---------------------------------------------------------------------
--- Logging
+-- Vérification fuel de départ
 ---------------------------------------------------------------------
-local function print(text)
-    oldprint("[" .. os.time() .. "] " .. text)
-    local file = fs.open("turtleLog", "a")
-    file.writeLine("[" .. os.time() .. "] " .. text)
-    file.close()
-end
-
----------------------------------------------------------------------
--- Initialisation des slots "poubelle"
----------------------------------------------------------------------
-for i = 1, 13 do
-    if turtle.getItemCount(i) == 0 then
-        nSlots = i - 1
-        print("You have " .. nSlots .. " stacks of waste blocks, is this correct? Y/N")
-        while true do
-            local _, char = os.pullEvent("char")
-            char = char:lower()
-            if char == "n" then
-                error()
-            elseif char == "y" then
-                break
-            end
-        end
-        break
-    end
-end
-
-if not nSlots then
-    nSlots = 13
-    print("You have 13 stacks of waste blocks (slots 1–13).")
-end
-
 if turtle.getItemCount(16) == 0 then
-    print("Are you sure you wish to continue with no fuel in slot 16? Y/N")
-    while true do
-        local _, char = os.pullEvent("char")
-        char = char:lower()
-        if char == "n" then
-            error()
-        elseif char == "y" then
-            break
-        end
-    end
+  print("No fuel in slot 16. Continue anyway? (Y/N)")
+  while true do
+    local _, ch = os.pullEvent("char")
+    ch = ch:lower()
+    if ch == "n" then error("Aborted: no fuel.") end
+    if ch == "y" then break end
+  end
 end
 
 ---------------------------------------------------------------------
--- Coords & déplacements
+-- Coordonnées et orientation
 ---------------------------------------------------------------------
--- Coordonnées relatives au point de départ (0,0,0) au-dessus du coffre
--- x : vers l'avant initial, z : vers la droite initiale, y : vers le bas
+-- Coordonnées relatives au point de départ (0,0,0)
+-- x : avant, z : droite, y : vers le bas
 local xPos, yPos, zPos = 0, 0, 0
 local dir = 0  -- 0=+x, 1=+z, 2=-x, 3=-z
 
-local needReturn = false   -- demander un retour coffre (inventaire plein, etc.)
-local timeUp     = false   -- temps écoulé (trackTime)
+-- Pour reprise après dépôt
 local savedX, savedY, savedZ, savedDir = 0, 0, 0, 0
 
 local function turnLeft()
-    turtle.turnLeft()
-    dir = (dir + 3) % 4
+  turtle.turnLeft()
+  dir = (dir + 3) % 4
+  os.sleep(0)
 end
 
 local function turnRight()
-    turtle.turnRight()
-    dir = (dir + 1) % 4
-end
-
-local function forward()
-    while turtle.detect() do turtle.dig() end
-    while not turtle.forward() do
-        turtle.attack()
-        turtle.dig()
-    end
-    if dir == 0 then
-        xPos = xPos + 1
-    elseif dir == 1 then
-        zPos = zPos + 1
-    elseif dir == 2 then
-        xPos = xPos - 1
-    else
-        zPos = zPos - 1
-    end
-end
-
-local function up()
-    while turtle.detectUp() do turtle.digUp() end
-    while not turtle.up() do
-        turtle.attackUp()
-        turtle.digUp()
-    end
-    yPos = yPos - 1
-end
-
-local function down()
-    while turtle.detectDown() do turtle.digDown() end
-    while not turtle.down() do
-        turtle.attackDown()
-        turtle.digDown()
-    end
-    yPos = yPos + 1
+  turtle.turnRight()
+  dir = (dir + 1) % 4
+  os.sleep(0)
 end
 
 local function face(targetDir)
-    while dir ~= targetDir do
-        -- calcul du meilleur sens de rotation
-        local diff = (targetDir - dir) % 4
-        if diff == 1 then
-            turnRight()
-        elseif diff == 3 then
-            turnLeft()
-        else
-            -- 2
-            turnRight()
-            turnRight()
-        end
+  while dir ~= targetDir do
+    local diff = (targetDir - dir) % 4
+    if diff == 1 then
+      turnRight()
+    elseif diff == 3 then
+      turnLeft()
+    else
+      turnRight()
+      turnRight()
     end
+  end
+end
+
+local function forward()
+  while turtle.detect() do turtle.dig() end
+  while not turtle.forward() do
+    turtle.attack()
+    turtle.dig()
+  end
+  if dir == 0 then
+    xPos = xPos + 1
+  elseif dir == 1 then
+    zPos = zPos + 1
+  elseif dir == 2 then
+    xPos = xPos - 1
+  else
+    zPos = zPos - 1
+  end
+  os.sleep(0) -- yield
+end
+
+local function up()
+  while turtle.detectUp() do turtle.digUp() end
+  while not turtle.up() do
+    turtle.attackUp()
+    turtle.digUp()
+  end
+  yPos = yPos - 1
+  os.sleep(0)
+end
+
+local function down()
+  while turtle.detectDown() do turtle.digDown() end
+  while not turtle.down() do
+    turtle.attackDown()
+    turtle.digDown()
+  end
+  yPos = yPos + 1
+  os.sleep(0)
 end
 
 local function goTo(targetX, targetY, targetZ)
-    -- Ajuster Y d'abord
-    while yPos < targetY do
-        down()
-    end
-    while yPos > targetY do
-        up()
-    end
+  -- Ajuster Y d'abord
+  while yPos < targetY do
+    down()
+  end
+  while yPos > targetY do
+    up()
+  end
 
-    -- Ajuster X
-    if xPos < targetX then
-        face(0) -- +x
-        while xPos < targetX do
-            forward()
-        end
-    elseif xPos > targetX then
-        face(2) -- -x
-        while xPos > targetX do
-            forward()
-        end
-    end
+  -- Ajuster X
+  if xPos < targetX then
+    face(0)
+    while xPos < targetX do forward() end
+  elseif xPos > targetX then
+    face(2)
+    while xPos > targetX do forward() end
+  end
 
-    -- Ajuster Z
-    if zPos < targetZ then
-        face(1) -- +z
-        while zPos < targetZ do
-            forward()
-        end
-    elseif zPos > targetZ then
-        face(3) -- -z
-        while zPos > targetZ do
-            forward()
-        end
-    end
+  -- Ajuster Z
+  if zPos < targetZ then
+    face(1)
+    while zPos < targetZ do forward() end
+  elseif zPos > targetZ then
+    face(3)
+    while zPos > targetZ do forward() end
+  end
 end
 
 ---------------------------------------------------------------------
--- Gestion des déchets
+-- Inventaire & coffre derrière
 ---------------------------------------------------------------------
-local function dumpWaste()
-    while ok do
-        for i = 1, nSlots do
-            local count = turtle.getItemCount(i)
-            if count > 1 then
-                turtle.select(i)
-                turtle.drop(count - 1)
-            end
-        end
-        local id = os.startTimer(10)
-        while true do
-            local _, tid = os.pullEvent("timer")
-            if tid == id then break end
-        end
+local function hasInventorySpace()
+  -- slots 1..14 = loot, 15 bucket, 16 fuel
+  for i = 1, 14 do
+    if turtle.getItemCount(i) == 0 then
+      return true
     end
-end
-
----------------------------------------------------------------------
--- Excavation bas niveau
----------------------------------------------------------------------
-local function digForward2High()
-    forward()
-    if turtle.detectUp() then turtle.digUp() end
+  end
+  return false
 end
 
 local function dropInventory()
-    print("[return]: Dropping inventory into chest below!")
-    for i = 5, 16 do
-        turtle.select(i)
-        turtle.dropDown()
-    end
+  print("[return]: Dropping inventory into chest behind!")
+  face(2) -- regarder -X (coffre derrière)
+  for i = 1, 14 do
+    turtle.select(i)
+    turtle.drop()      -- on drop DANS le coffre derrière
+  end
+  os.sleep(0)
+end
+
+local function savePosition()
+  savedX, savedY, savedZ, savedDir = xPos, yPos, zPos, dir
+end
+
+local function restorePosition()
+  goTo(savedX, savedY, savedZ)
+  face(savedDir)
 end
 
 local function returnAndMaybeResume()
-    print("[return]: Handling return to chest...")
+  print("[return]: Handling return to chest...")
 
-    -- Sauvegarder la position actuelle
-    savedX, savedY, savedZ, savedDir = xPos, yPos, zPos, dir
+  savePosition()
 
-    -- Aller au point de départ (0,0,0)
-    goTo(0, 0, 0)
-    face(0)
+  -- Retour au point de départ (0,0,0)
+  goTo(0, 0, 0)
+  face(0)
 
-    -- Déposer le contenu dans le coffre sous la turtle
-    dropInventory()
+  -- Déposer l’inventaire
+  dropInventory()
 
-    if timeUp or not ok then
-        print("[return]: Time is up or script stopped, not resuming mining.")
-        needReturn = false
-        return
-    end
-
-    -- Revenir à la position sauvegardée
-    print(string.format("[return]: Resuming mining at (%d,%d,%d)", savedX, savedY, savedZ))
-    goTo(savedX, savedY, savedZ)
-    face(savedDir)
+  if timeUp or not ok then
+    print("[return]: Time is up or script stopped, not resuming mining.")
     needReturn = false
+    return
+  end
+
+  print(string.format("[return]: Resuming at (%d,%d,%d)", savedX, savedY, savedZ))
+  restorePosition()
+  needReturn = false
 end
 
 ---------------------------------------------------------------------
--- Excavation d’une couche (2D) sizeX × sizeZ, à la profondeur courante
+-- Refuel avec lave (seau en slot 15)
+---------------------------------------------------------------------
+local function tryRefuelFromLavaDirection(placeFunc)
+  if turtle.getItemCount(15) == 0 then return false end
+  turtle.select(15)
+  if placeFunc() then
+    -- On a peut-être pris de la lave dans le seau
+    if turtle.refuel() then
+      print("[fuel]: Refueled using lava!")
+      os.sleep(0)
+      return true
+    else
+      -- Pas de lava (eau, autre) -> replacer
+      turtle.place()
+    end
+  end
+  return false
+end
+
+local function tryRefuelFromLava()
+  print("[fuel]: Trying to refuel from lava...")
+  -- Essayer devant
+  if tryRefuelFromLavaDirection(turtle.place) then return true end
+  -- Essayer en dessous
+  if tryRefuelFromLavaDirection(turtle.placeDown) then return true end
+  -- Essayer au-dessus
+  if tryRefuelFromLavaDirection(turtle.placeUp) then return true end
+  -- Essayer droite/gauche en se tournant
+  face(1)
+  if tryRefuelFromLavaDirection(turtle.place) then face(0); return true end
+  face(3)
+  if tryRefuelFromLavaDirection(turtle.place) then face(0); return true end
+  face(0)
+  print("[fuel]: No lava source found to refuel.")
+  return false
+end
+
+---------------------------------------------------------------------
+-- Minage de bas niveau
+---------------------------------------------------------------------
+local function digForward2High()
+  forward()
+  if turtle.detectUp() then turtle.digUp() end
+  os.sleep(0)
+end
+
+---------------------------------------------------------------------
+-- Excavation d’une couche horizontale (X × Z) à la profondeur actuelle
 ---------------------------------------------------------------------
 local function excavateLayer()
-    -- On suppose qu'on se trouve au coin (0,y,z=0) de cette couche et qu'on regarde +x
-    face(0)
+  -- On part de (0,y,0) de la couche, en regardant +x
+  face(0)
 
-    for row = 0, sizeZ - 1 do
-        -- creuser cette ligne
-        for col = 1, sizeX - 1 do
-            if needReturn then
-                returnAndMaybeResume()
-                if timeUp or not ok then return end
-            end
-            digForward2High()
-        end
-
-        -- Aller à la ligne suivante si ce n'était pas la dernière
-        if row < sizeZ - 1 then
-            if row % 2 == 0 then
-                -- on est à x = sizeX - 1, aller à z+1 et revenir dans l'autre sens
-                turnRight()
-                digForward2High()
-                turnRight()
-            else
-                -- on est à x = 0
-                turnLeft()
-                digForward2High()
-                turnLeft()
-            end
-        end
+  for row = 0, sizeZ - 1 do
+    for col = 1, sizeX - 1 do
+      if not ok then return end
+      if needReturn then
+        returnAndMaybeResume()
+        if timeUp or not ok then return end
+      end
+      digForward2High()
     end
 
-    -- Revenir au coin de la couche (x=0,z=0,y inchangé)
-    goTo(0, yPos, 0)
-    face(0)
+    if row < sizeZ - 1 then
+      if row % 2 == 0 then
+        -- On est en x = sizeX - 1
+        turnRight()
+        digForward2High()
+        turnRight()
+      else
+        -- On est en x = 0
+        turnLeft()
+        digForward2High()
+        turnLeft()
+      end
+    end
+  end
+
+  -- Revenir au coin (0,y,0) de la couche
+  goTo(0, yPos, 0)
+  face(0)
 end
 
 ---------------------------------------------------------------------
--- Excavation complète 3D : sizeX × sizeZ × sizeY
+-- Excavation complète : Y couches successives vers le bas
 ---------------------------------------------------------------------
 local function excavateVolume()
-    print(string.format("[main]: Excavating volume %dx%dx%d", sizeX, sizeZ, sizeY))
+  print(string.format("[main]: Excavating %dx%dx%d", sizeX, sizeZ, sizeY))
+  print("[main]: Chest must be behind the turtle at start.")
 
-    -- On part de (0,0,0) au-dessus du coffre, on va creuser vers le bas
-    for layer = 1, sizeY do
-        if needReturn then
-            returnAndMaybeResume()
-            if timeUp or not ok then return end
-        end
-
-        print("[main]: Starting layer " .. layer .. "/" .. sizeY)
-
-        -- descendre d'un bloc pour entrer dans la nouvelle couche
-        down()
-
-        -- creuser la couche à cette profondeur
-        excavateLayer()
-
-        if timeUp or not ok then
-            break
-        end
+  for layer = 1, sizeY do
+    if not ok then break end
+    if needReturn then
+      returnAndMaybeResume()
+      if timeUp or not ok then break end
     end
 
-    print("[main]: Excavation loop finished, returning to chest.")
-    -- Retour final au coffre
-    goTo(0, 0, 0)
-    face(0)
-    dropInventory()
+    print("[main]: Starting layer " .. layer .. "/" .. sizeY)
+
+    down()          -- descendre dans la nouvelle couche
+    excavateLayer() -- creuser X×Z à cette profondeur
+  end
+
+  print("[main]: Excavation finished or stopped, returning to chest.")
+  goTo(0, 0, 0)
+  face(0)
+  dropInventory()
 end
 
 ---------------------------------------------------------------------
--- Gestion fuel / sécurité / timer
+-- Gestion fuel / sécurité
 ---------------------------------------------------------------------
-local function findMaxLevel()
-    local level = turtle.getFuelLevel()
-    if turtle.getItemCount(16) > 1 then
-        if not fuelAmount then
-            turtle.select(16)
-            turtle.refuel(1)
-            fuelAmount = turtle.getFuelLevel() - level
-            print("[findMaxLevel]: Found fuelAmount: " .. fuelAmount)
-        end
-        local maxLevel = turtle.getItemCount(16) * fuelAmount + turtle.getFuelLevel()
-        print("[findMaxLevel]: Found max level: " .. maxLevel .. "!")
-        return maxLevel
-    else
-        print("[findMaxLevel]: Found max level: " .. turtle.getFuelLevel() .. "!")
-        return turtle.getFuelLevel()
-    end
-end
-
 local function isOk()
-    local okLevel = findMaxLevel() / 2 + 10
-    while ok do
-        local currentLevel = turtle.getFuelLevel()
+  while ok do
+    local fuel = turtle.getFuelLevel()
 
-        -- Vérifier le fuel
-        if currentLevel < 100 then
-            print("[isOk]: Fuel Level Low!")
-            if turtle.getItemCount(16) > 0 then
-                print("[isOk]: Refueling!")
-                turtle.select(16)
-                if turtle.refuel(1) then
-                    print("[isOk]: Refuel Successful!")
-                else
-                    print("[isOk]: Refuel Unsuccessful, Initiating return and stop!")
-                    ok = false
-                    needReturn = true
-                end
-            else
-                print("[isOk]: No fuel in slot 16, Initiating return and stop!")
-                ok = false
-                needReturn = true
-            end
-        elseif okLevel - ignoredFuel > findMaxLevel() then
-            print("[isOk]: Fuel Reserves Depleted!  Initiating return and stop!")
-            ok = false
-            needReturn = true
+    -- Fuel bas -> essayer de refuel
+    if fuel ~= "unlimited" and fuel < 200 then
+      print("[isOk]: Fuel low (" .. fuel .. ")!")
+      if turtle.getItemCount(16) > 0 then
+        turtle.select(16)
+        if turtle.refuel(1) then
+          print("[fuel]: Refueled from slot 16.")
+        else
+          print("[fuel]: Cannot refuel from slot 16.")
         end
-
-        -- Vérifier l'espace dans l'inventaire
-        local hasSpace = false
-        for i = 5, 15 do
-            if turtle.getItemCount(i) == 0 then
-                hasSpace = true
-                break
-            end
+      else
+        -- Pas de fuel solide : essayer la lave
+        if not tryRefuelFromLava() then
+          print("[fuel]: No fuel available, returning and stopping.")
+          ok = false
+          needReturn = true
         end
-
-        if not hasSpace and ok then
-            print("[isOk]: Out of space! Returning to chest, will resume mining!")
-            needReturn = true
-        elseif ok then
-            print("[isOk]: Everything is OK!")
-            local id = os.startTimer(10)
-            while true do
-                local _, tid = os.pullEvent("timer")
-                if tid == id then break end
-            end
-        end
+      end
     end
+
+    -- Vérifier l'inventaire
+    if ok and not hasInventorySpace() then
+      print("[isOk]: Inventory full, returning to chest (will resume).")
+      needReturn = true
+    end
+
+    if ok then
+      print("[isOk]: Everything OK.")
+      local id = os.startTimer(10)
+      while true do
+        local _, tid = os.pullEvent("timer")
+        if tid == id then break end
+      end
+    end
+  end
 end
 
+---------------------------------------------------------------------
+-- Gestion du temps (optionnelle)
+---------------------------------------------------------------------
 local function trackTime()
-    if #timeArgs == 0 then
-        print("[trackTime]: No valid duration provided, running without time limit.")
-        return
-    end
+  if #timeArgs == 0 then
+    print("[trackTime]: No duration provided, running without time limit.")
+    return
+  end
 
-    local sTime = table.concat(timeArgs, " ")
-    local nSeconds = 0
+  local sTime = table.concat(timeArgs, " ")
+  local nSeconds = 0
 
-    for numStr, period in sTime:gmatch("(%d+)%s+(%a+)s?") do
-        local i = tonumber(numStr)
-        if i then
-            local p = period:lower()
-            if p == "second" or p == "seconds" then
-                nSeconds = nSeconds + i
-            elseif p == "minute" or p == "minutes" then
-                nSeconds = nSeconds + (i * 60)
-            elseif p == "hour" or p == "hours" then
-                nSeconds = nSeconds + (i * 3600)
-            end
-        end
+  for numStr, period in sTime:gmatch("(%d+)%s+(%a+)s?") do
+    local n = tonumber(numStr)
+    if n then
+      local p = period:lower()
+      if p == "second" or p == "seconds" then
+        nSeconds = nSeconds + n
+      elseif p == "minute" or p == "minutes" then
+        nSeconds = nSeconds + n * 60
+      elseif p == "hour" or p == "hours" then
+        nSeconds = nSeconds + n * 3600
+      end
     end
+  end
 
-    if nSeconds <= 0 then
-        print("[trackTime]: No valid duration parsed, running without time limit.")
-        return
-    end
+  if nSeconds <= 0 then
+    print("[trackTime]: Could not parse duration, running without time limit.")
+    return
+  end
 
-    print("[trackTime]: Starting timer for " .. nSeconds .. " seconds!")
-    local id = os.startTimer(nSeconds)
-    while ok do
-        local _, tid = os.pullEvent("timer")
-        if id == tid then
-            print("[trackTime]: End of session reached! Returning to base and stopping!")
-            timeUp = true
-            ok = false
-        end
+  print("[trackTime]: Timer started for " .. nSeconds .. " seconds.")
+  local id = os.startTimer(nSeconds)
+  while ok do
+    local _, tid = os.pullEvent("timer")
+    if tid == id then
+      print("[trackTime]: Time over, returning and stopping.")
+      timeUp = true
+      ok = false
     end
+  end
 end
 
 ---------------------------------------------------------------------
 -- Lancement parallèle
 ---------------------------------------------------------------------
-parallel.waitForAll(trackTime, isOk, excavateVolume, dumpWaste)
+parallel.waitForAll(trackTime, isOk, excavateVolume)
